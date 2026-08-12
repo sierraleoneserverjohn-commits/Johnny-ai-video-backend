@@ -1,7 +1,7 @@
 {
   "name": "johnny-ai-video-backend",
   "version": "1.0.0",
-  "description": "Backend cluster for Johnny Tec AI Video Studio",
+  "description": "Johnny Tec AI Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
