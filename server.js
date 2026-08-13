@@ -21,10 +21,33 @@ app.post('/api/generate-video', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Prompt is required.' });
   }
 
-  // Provider chain priority order
-  const providersToTry = autoFallback
-    ? [provider, ...['fal', 'replicate', 'google'].filter(p => p !== provider)]
-    : [provider];
+  // Detect which keys actually exist on Render
+  const activeProviders = [];
+  if (process.env.FAL_KEY) activeProviders.push('fal');
+  if (process.env.REPLICATE_API_TOKEN) activeProviders.push('replicate');
+  if (process.env.GOOGLE_VEO_API_KEY) activeProviders.push('google');
+
+  // Build provider queue
+  let providersToTry = [];
+
+  if (autoFallback) {
+    // Put selected provider first, followed by remaining configured providers
+    providersToTry = [
+      provider,
+      ...activeProviders.filter(p => p !== provider)
+    ];
+    // Fallback: If selected provider has no key, filter to unique active providers
+    providersToTry = [...new Set(providersToTry)].filter(p => activeProviders.includes(p));
+  } else {
+    providersToTry = [provider];
+  }
+
+  if (providersToTry.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: `No active API keys found on Render for requested provider '${provider}'. Please add environment variables on Render.`
+    });
+  }
 
   let lastError = null;
 
@@ -36,7 +59,7 @@ app.post('/api/generate-video', async (req, res) => {
       if (currentProvider === 'fal') {
         videoUrl = await generateFal(prompt, imageUrl, aspectRatio);
       } else if (currentProvider === 'replicate') {
-        videoUrl = await generateReplicate(prompt, imageUrl, aspectRatio);
+        videoUrl = await generateReplicate(prompt, imageUrl);
       } else if (currentProvider === 'google') {
         videoUrl = await generateGoogle(prompt);
       }
@@ -47,13 +70,13 @@ app.post('/api/generate-video', async (req, res) => {
       }
     } catch (err) {
       console.error(`Failed on [${currentProvider.toUpperCase()}]:`, err.message);
-      lastError = err.message;
+      lastError = `[${currentProvider.toUpperCase()}]: ${err.message}`;
     }
   }
 
   return res.status(500).json({
     success: false,
-    error: `All configured API providers failed to generate video or lack active API Keys on Render. Last error: ${lastError}`
+    error: `API generation failed. ${lastError || 'Check your API keys and balances.'}`
   });
 });
 
@@ -70,7 +93,7 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
 
   const payload = imageUrl ? { prompt, image_url: imageUrl } : { prompt, aspect_ratio: aspectRatio };
 
-  console.log('[FAL.AI] Submitting job...');
+  console.log('[FAL.AI] Submitting request...');
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -82,14 +105,14 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`FAL API HTTP ${response.status}: ${errText}`);
+    throw new Error(`HTTP ${response.status}: ${errText}`);
   }
 
   const data = await response.json();
   const requestId = data.request_id;
-  if (!requestId) throw new Error('FAL did not return a request_id.');
+  if (!requestId) throw new Error('FAL did not return a valid request_id.');
 
-  // Poll for completion
+  // Poll queue status
   const statusUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}/status`;
   const resultUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}`;
 
@@ -98,6 +121,8 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
     const statusRes = await fetch(statusUrl, {
       headers: { 'Authorization': `Key ${FAL_KEY}` }
     });
+    
+    if (!statusRes.ok) continue;
     const statusData = await statusRes.json();
 
     if (statusData.status === 'COMPLETED') {
@@ -107,54 +132,58 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
       const finalData = await resVal.json();
       return finalData.video?.url || finalData.video_url;
     } else if (statusData.status === 'FAILED') {
-      throw new Error(`FAL processing failed: ${statusData.error}`);
+      throw new Error(`Processing failed: ${statusData.error || 'Unknown error'}`);
     }
   }
-  throw new Error('FAL request timed out.');
+  throw new Error('FAL generation timed out after 120 seconds.');
 }
 
-// 2. REPLICATE Engine (Updated to active minimax model)
-async function generateReplicate(prompt, imageUrl, aspectRatio) {
+// 2. REPLICATE Engine
+async function generateReplicate(prompt, imageUrl) {
   const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
   if (!REPLICATE_API_TOKEN) throw new Error('REPLICATE_API_TOKEN environment variable missing on Render.');
 
-  console.log('[Replicate] Starting generation...');
-  const response = await fetch('https://api.replicate.com/v1/predictions', {
+  console.log('[Replicate] Submitting request...');
+  
+  const inputPayload = {
+    prompt: prompt,
+    prompt_optimizer: true
+  };
+  if (imageUrl) {
+    inputPayload.first_frame_image = imageUrl;
+  }
+
+  // Official model endpoint for MiniMax Video-01
+  const response = await fetch('https://api.replicate.com/v1/models/minimax/video-01/predictions', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${REPLICATE_API_TOKEN}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      // Active working model on Replicate
-      version: "minimax/video-01",
-      input: {
-        prompt: prompt,
-        prompt_optimizer: true
-      }
-    })
+    body: JSON.stringify({ input: inputPayload })
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Replicate API HTTP ${response.status}: ${errText}`);
+    throw new Error(`HTTP ${response.status}: ${errText}`);
   }
 
   let prediction = await response.json();
 
   // Poll prediction status
   while (prediction.status !== 'succeeded' && prediction.status !== 'failed') {
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 4000));
     const checkRes = await fetch(prediction.urls.get, {
       headers: { 'Authorization': `Bearer ${REPLICATE_API_TOKEN}` }
     });
+    if (!checkRes.ok) continue;
     prediction = await checkRes.json();
   }
 
   if (prediction.status === 'succeeded') {
     return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
   } else {
-    throw new Error(`Replicate generation failed: ${prediction.error}`);
+    throw new Error(`Replicate generation failed: ${prediction.error || 'Unknown error'}`);
   }
 }
 
@@ -163,7 +192,7 @@ async function generateGoogle(prompt) {
   const GOOGLE_KEY = process.env.GOOGLE_VEO_API_KEY;
   if (!GOOGLE_KEY) throw new Error('GOOGLE_VEO_API_KEY environment variable missing on Render.');
 
-  throw new Error('Google Veo API endpoint path requires Google Vertex AI project configuration.');
+  throw new Error('Google Veo API endpoint requires active Vertex AI project configuration.');
 }
 
 app.listen(PORT, () => {
