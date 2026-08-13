@@ -1,235 +1,171 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const { fal } = require('@fal-ai/serverless-client');
-const Replicate = require('replicate');
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
 const PORT = process.env.PORT || 10000;
 
-// Middleware
-app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '20mb' }));
-
-// Safe Configuration Helper
-function configureServices() {
-  if (process.env.FAL_KEY) {
-    try {
-      fal.config({ credentials: process.env.FAL_KEY });
-    } catch (e) {
-      console.warn('FAL setup warning:', e.message);
-    }
-  }
-
-  let replicateInstance = null;
-  if (process.env.REPLICATE_API_TOKEN) {
-    try {
-      replicateInstance = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-    } catch (e) {
-      console.warn('Replicate setup warning:', e.message);
-    }
-  }
-  return replicateInstance;
-}
-
-const replicate = configureServices();
-
-// ==========================================
-// INDIVIDUAL PROVIDER HANDLERS
-// ==========================================
-
-// 1. FAL.AI
-async function generateFal(prompt, imageUrl, aspectRatio) {
-  if (!process.env.FAL_KEY) throw new Error('FAL_KEY environment variable missing on Render.');
-  console.log('[FAL.AI] Starting generation...');
-  
-  const endpoint = imageUrl ? 'fal-ai/minimax-video/image-to-video' : 'fal-ai/hunyuan-video';
-  const input = imageUrl 
-    ? { prompt, image_url: imageUrl }
-    : { prompt, aspect_ratio: aspectRatio || '16:9' };
-
-  const result = await fal.subscribe(endpoint, { input, logs: true });
-
-  if (result?.video?.url) return result.video.url;
-  if (result?.data?.video?.url) return result.data.video.url;
-  throw new Error('FAL.AI did not return a valid video URL.');
-}
-
-// 2. REPLICATE
-async function generateReplicate(prompt, imageUrl) {
-  if (!replicate) throw new Error('REPLICATE_API_TOKEN environment variable missing on Render.');
-  console.log('[Replicate] Starting generation...');
-  
-  const model = imageUrl 
-    ? "stability-ai/stable-video-diffusion:3f0457e4619da6173739e26c2793864390fd65155a704b08c1d0ef80c7307205"
-    : "lucataco/hunyuan-video:847da544d0b1a03f569f6888c7512214470dcb512e0f49c06179e8c56c24190c";
-
-  const input = imageUrl ? { input_image: imageUrl } : { prompt };
-  const output = await replicate.run(model, { input });
-  
-  if (Array.isArray(output) && output[0]) return output[0];
-  if (typeof output === 'string') return output;
-  throw new Error('Replicate did not return a valid video output.');
-}
-
-// 3. GOOGLE VEO
-async function generateGoogleVeo(prompt, imageUrl) {
-  console.log('[Google Veo] Starting generation...');
-  const apiKey = process.env.GOOGLE_VEO_API_KEY;
-  if (!apiKey) throw new Error('GOOGLE_VEO_API_KEY environment variable missing on Render.');
-
-  const response = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/veo-001:generateVideo?key=${apiKey}`,
-    {
-      prompt: { text: prompt },
-      image: imageUrl ? { gcsUri: imageUrl } : undefined,
-    },
-    { headers: { 'Content-Type': 'application/json' } }
-  );
-
-  const videoUri = response.data?.generatedVideos?.[0]?.video?.uri || response.data?.videoUrl;
-  if (videoUri) return videoUri;
-  throw new Error('Google Veo generation failed or returned empty payload.');
-}
-
-// 4. LEONARDO.AI
-async function generateLeonardo(prompt, imageUrl) {
-  console.log('[Leonardo.ai] Starting generation...');
-  const apiKey = process.env.LEONARDO_API_KEY;
-  if (!apiKey) throw new Error('LEONARDO_API_KEY environment variable missing on Render.');
-
-  const response = await axios.post(
-    'https://cloud.leonardo.ai/api/rest/v1/generations-motion-init',
-    { imageId: imageUrl, motionStrength: 5 },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    }
-  );
-
-  const generationId = response.data?.motionGenerationJob?.generationId;
-  if (!generationId) throw new Error('Failed to initiate Leonardo Motion.');
-
-  let videoUrl = null;
-  for (let i = 0; i < 15; i++) {
-    await new Promise((r) => setTimeout(r, 4000));
-    const statusRes = await axios.get(
-      `https://cloud.leonardo.ai/api/rest/v1/generations/${generationId}`,
-      { headers: { Authorization: `Bearer ${apiKey}` } }
-    );
-    const job = statusRes.data?.generations_by_pk;
-    if (job?.generated_images?.[0]?.motionMP4URL) {
-      videoUrl = job.generated_images[0].motionMP4URL;
-      break;
-    }
-  }
-
-  if (videoUrl) return videoUrl;
-  throw new Error('Leonardo.ai motion generation timed out.');
-}
-
-// 5. JSON2VIDEO
-async function generateJson2Video(prompt) {
-  console.log('[JSON2Video] Starting render...');
-  const apiKey = process.env.JSON2VIDEO_API_KEY;
-  if (!apiKey) throw new Error('JSON2VIDEO_API_KEY environment variable missing on Render.');
-
-  const response = await axios.post(
-    'https://api.json2video.com/v2/movies',
-    {
-      comment: 'Johnny Tec AI Auto-Render',
-      resolution: 'hd',
-      draft: false,
-      scenes: [
-        {
-          elements: [{ type: 'text', text: prompt, style: 'heading', duration: 5 }],
-        },
-      ],
-    },
-    {
-      headers: {
-        'x-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-    }
-  );
-
-  const projectUrl = response.data?.movie?.url;
-  if (projectUrl) return projectUrl;
-  throw new Error('JSON2Video template creation failed.');
-}
-
-// Map Providers
-const PROVIDER_MAP = {
-  fal: generateFal,
-  replicate: generateReplicate,
-  google: generateGoogleVeo,
-  leonardo: generateLeonardo,
-  json2video: generateJson2Video,
-};
-
-const FALLBACK_ORDER = ['fal', 'replicate', 'google', 'leonardo', 'json2video'];
-
-// ==========================================
-// MAIN API ENDPOINTS
-// ==========================================
-
-// Health Check
+// Root Endpoint Health Check
 app.get('/', (req, res) => {
-  res.json({ status: 'Online', service: 'Johnny Tec AI Video Backend Cluster' });
+  res.json({ status: "online", message: "Johnny Tec AI Video Cluster Active" });
 });
 
-// Generation Route
+// Primary Video Generation Route
 app.post('/api/generate-video', async (req, res) => {
-  const { prompt, provider = 'fal', autoFallback = true, imageUrl, aspectRatio, resolution } = req.body;
+  const { prompt, provider = 'fal', autoFallback = true, imageUrl, aspectRatio = '16:9' } = req.body;
 
-  if (!prompt && !imageUrl) {
-    return res.status(400).json({ success: false, error: 'Either a prompt or source photo is required.' });
+  if (!prompt) {
+    return res.status(400).json({ success: false, error: 'Prompt is required.' });
   }
 
-  console.log(`\n--- Incoming Request | Primary Engine: [${provider.toUpperCase()}] ---`);
-
-  const queue = autoFallback
-    ? [provider, ...FALLBACK_ORDER.filter((p) => p !== provider)]
+  // Provider chain priority order
+  const providersToTry = autoFallback
+    ? [provider, ...['fal', 'replicate', 'google'].filter(p => p !== provider)]
     : [provider];
 
-  const executionLogs = [];
+  let lastError = null;
 
-  for (const currentProvider of queue) {
+  for (const currentProvider of providersToTry) {
     try {
       console.log(`Executing engine: [${currentProvider.toUpperCase()}]`);
-      const handler = PROVIDER_MAP[currentProvider];
+      let videoUrl = null;
 
-      if (!handler) {
-        throw new Error(`Engine ${currentProvider} is not implemented.`);
+      if (currentProvider === 'fal') {
+        videoUrl = await generateFal(prompt, imageUrl, aspectRatio);
+      } else if (currentProvider === 'replicate') {
+        videoUrl = await generateReplicate(prompt, imageUrl, aspectRatio);
+      } else if (currentProvider === 'google') {
+        videoUrl = await generateGoogle(prompt);
       }
 
-      const videoUrl = await handler(prompt, imageUrl, aspectRatio, resolution);
-
-      console.log(`✅ Success via [${currentProvider.toUpperCase()}]: ${videoUrl}`);
-      return res.json({
-        success: true,
-        provider: currentProvider,
-        videoUrl: videoUrl,
-        logs: executionLogs,
-      });
+      if (videoUrl) {
+        console.log(`Successfully generated video via [${currentProvider.toUpperCase()}]`);
+        return res.json({ success: true, provider: currentProvider, videoUrl });
+      }
     } catch (err) {
-      console.error(`❌ Failed on [${currentProvider.toUpperCase()}]: ${err.message}`);
-      executionLogs.push({ provider: currentProvider, error: err.message });
+      console.error(`Failed on [${currentProvider.toUpperCase()}]:`, err.message);
+      lastError = err.message;
     }
   }
 
   return res.status(500).json({
     success: false,
-    error: 'All configured API providers failed to generate video or lack active API Keys on Render.',
-    details: executionLogs,
+    error: `All configured API providers failed to generate video or lack active API Keys on Render. Last error: ${lastError}`
   });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Johnny Tec AI Backend listening on port ${PORT}`);
+// --- PROVIDER IMPLEMENTATIONS ---
+
+// 1. FAL.AI Engine
+async function generateFal(prompt, imageUrl, aspectRatio) {
+  const FAL_KEY = process.env.FAL_KEY;
+  if (!FAL_KEY) throw new Error('FAL_KEY environment variable missing on Render.');
+
+  const endpoint = imageUrl 
+    ? 'https://queue.fal.run/fal-ai/minimax/video-01/image-to-video'
+    : 'https://queue.fal.run/fal-ai/minimax/video-01';
+
+  const payload = imageUrl ? { prompt, image_url: imageUrl } : { prompt, aspect_ratio: aspectRatio };
+
+  console.log('[FAL.AI] Submitting job...');
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Key ${FAL_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`FAL API HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const requestId = data.request_id;
+  if (!requestId) throw new Error('FAL did not return a request_id.');
+
+  // Poll for completion
+  const statusUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}/status`;
+  const resultUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}`;
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 4000));
+    const statusRes = await fetch(statusUrl, {
+      headers: { 'Authorization': `Key ${FAL_KEY}` }
+    });
+    const statusData = await statusRes.json();
+
+    if (statusData.status === 'COMPLETED') {
+      const resVal = await fetch(resultUrl, {
+        headers: { 'Authorization': `Key ${FAL_KEY}` }
+      });
+      const finalData = await resVal.json();
+      return finalData.video?.url || finalData.video_url;
+    } else if (statusData.status === 'FAILED') {
+      throw new Error(`FAL processing failed: ${statusData.error}`);
+    }
+  }
+  throw new Error('FAL request timed out.');
+}
+
+// 2. REPLICATE Engine (Updated to active minimax model)
+async function generateReplicate(prompt, imageUrl, aspectRatio) {
+  const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
+  if (!REPLICATE_API_TOKEN) throw new Error('REPLICATE_API_TOKEN environment variable missing on Render.');
+
+  console.log('[Replicate] Starting generation...');
+  const response = await fetch('https://api.replicate.com/v1/predictions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${REPLICATE_API_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      // Active working model on Replicate
+      version: "minimax/video-01",
+      input: {
+        prompt: prompt,
+        prompt_optimizer: true
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Replicate API HTTP ${response.status}: ${errText}`);
+  }
+
+  let prediction = await response.json();
+
+  // Poll prediction status
+  while (prediction.status !== 'succeeded' && prediction.status !== 'failed') {
+    await new Promise(r => setTimeout(r, 3000));
+    const checkRes = await fetch(prediction.urls.get, {
+      headers: { 'Authorization': `Bearer ${REPLICATE_API_TOKEN}` }
+    });
+    prediction = await checkRes.json();
+  }
+
+  if (prediction.status === 'succeeded') {
+    return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+  } else {
+    throw new Error(`Replicate generation failed: ${prediction.error}`);
+  }
+}
+
+// 3. GOOGLE Engine Placeholder
+async function generateGoogle(prompt) {
+  const GOOGLE_KEY = process.env.GOOGLE_VEO_API_KEY;
+  if (!GOOGLE_KEY) throw new Error('GOOGLE_VEO_API_KEY environment variable missing on Render.');
+
+  throw new Error('Google Veo API endpoint path requires Google Vertex AI project configuration.');
+}
+
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
-                      
