@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
 app.use(cors());
@@ -21,22 +20,14 @@ app.post('/api/generate-video', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Prompt is required.' });
   }
 
-  // Detect which keys actually exist on Render
+  // Detect which keys exist on Render
   const activeProviders = [];
   if (process.env.FAL_KEY) activeProviders.push('fal');
   if (process.env.REPLICATE_API_TOKEN) activeProviders.push('replicate');
-  if (process.env.GOOGLE_VEO_API_KEY) activeProviders.push('google');
 
-  // Build provider queue
   let providersToTry = [];
-
   if (autoFallback) {
-    // Put selected provider first, followed by remaining configured providers
-    providersToTry = [
-      provider,
-      ...activeProviders.filter(p => p !== provider)
-    ];
-    // Fallback: If selected provider has no key, filter to unique active providers
+    providersToTry = [provider, ...activeProviders.filter(p => p !== provider)];
     providersToTry = [...new Set(providersToTry)].filter(p => activeProviders.includes(p));
   } else {
     providersToTry = [provider];
@@ -45,7 +36,7 @@ app.post('/api/generate-video', async (req, res) => {
   if (providersToTry.length === 0) {
     return res.status(400).json({
       success: false,
-      error: `No active API keys found on Render for requested provider '${provider}'. Please add environment variables on Render.`
+      error: `No active API keys found on Render for '${provider}'. Check your Render Environment Variables.`
     });
   }
 
@@ -60,8 +51,6 @@ app.post('/api/generate-video', async (req, res) => {
         videoUrl = await generateFal(prompt, imageUrl, aspectRatio);
       } else if (currentProvider === 'replicate') {
         videoUrl = await generateReplicate(prompt, imageUrl);
-      } else if (currentProvider === 'google') {
-        videoUrl = await generateGoogle(prompt);
       }
 
       if (videoUrl) {
@@ -112,7 +101,7 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
   const requestId = data.request_id;
   if (!requestId) throw new Error('FAL did not return a valid request_id.');
 
-  // Poll queue status
+  // Poll status
   const statusUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}/status`;
   const resultUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}`;
 
@@ -135,7 +124,7 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
       throw new Error(`Processing failed: ${statusData.error || 'Unknown error'}`);
     }
   }
-  throw new Error('FAL generation timed out after 120 seconds.');
+  throw new Error('FAL generation timed out.');
 }
 
 // 2. REPLICATE Engine
@@ -145,15 +134,9 @@ async function generateReplicate(prompt, imageUrl) {
 
   console.log('[Replicate] Submitting request...');
   
-  const inputPayload = {
-    prompt: prompt,
-    prompt_optimizer: true
-  };
-  if (imageUrl) {
-    inputPayload.first_frame_image = imageUrl;
-  }
+  const inputPayload = { prompt, prompt_optimizer: true };
+  if (imageUrl) inputPayload.first_frame_image = imageUrl;
 
-  // Official model endpoint for MiniMax Video-01
   const response = await fetch('https://api.replicate.com/v1/models/minimax/video-01/predictions', {
     method: 'POST',
     headers: {
@@ -170,7 +153,6 @@ async function generateReplicate(prompt, imageUrl) {
 
   let prediction = await response.json();
 
-  // Poll prediction status
   while (prediction.status !== 'succeeded' && prediction.status !== 'failed') {
     await new Promise(r => setTimeout(r, 4000));
     const checkRes = await fetch(prediction.urls.get, {
@@ -185,14 +167,6 @@ async function generateReplicate(prompt, imageUrl) {
   } else {
     throw new Error(`Replicate generation failed: ${prediction.error || 'Unknown error'}`);
   }
-}
-
-// 3. GOOGLE Engine Placeholder
-async function generateGoogle(prompt) {
-  const GOOGLE_KEY = process.env.GOOGLE_VEO_API_KEY;
-  if (!GOOGLE_KEY) throw new Error('GOOGLE_VEO_API_KEY environment variable missing on Render.');
-
-  throw new Error('Google Veo API endpoint requires active Vertex AI project configuration.');
 }
 
 app.listen(PORT, () => {
