@@ -229,7 +229,12 @@ app.post('/api/generate-video', async (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Johnny Tec AI Backend running on port ${PORT}`);
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Johnny Tec AI Backend listening on port ${PORT}`);
 });
+                                          
+
+ 
   
