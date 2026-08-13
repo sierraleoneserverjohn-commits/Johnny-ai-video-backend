@@ -6,7 +6,7 @@ const { fal } = require('@fal-ai/serverless-client');
 const Replicate = require('replicate');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
 // Middleware
 app.use(cors({ origin: '*' }));
@@ -229,12 +229,7 @@ app.post('/api/generate-video', async (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 10000;
-
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Johnny Tec AI Backend listening on port ${PORT}`);
 });
-                                          
-
- 
-  
+                      
