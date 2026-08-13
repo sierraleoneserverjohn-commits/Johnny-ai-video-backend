@@ -7,55 +7,72 @@ app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 10000;
 
-// Root Endpoint Health Check
 app.get('/', (req, res) => {
-  res.json({ status: "online", message: "Johnny Tec AI Video Cluster Active" });
+  res.json({ status: "online", message: "Johnny Tec AI Video & Post-Production Cluster Active" });
 });
 
-// Primary Video Generation Route
 app.post('/api/generate-video', async (req, res) => {
-  const { prompt, provider = 'fal', autoFallback = true, imageUrl, aspectRatio = '16:9' } = req.body;
+  const {
+    prompt,
+    provider = 'fal',
+    autoFallback = true,
+    imageUrl,
+    aspectRatio = '16:9',
+    // Custom JSON2Video Post-Production Options
+    captionText,
+    voiceoverText,
+    logoUrl,
+    musicUrl
+  } = req.body;
 
   if (!prompt) {
     return res.status(400).json({ success: false, error: 'Prompt is required.' });
   }
 
-  // Detect which keys exist on Render
+  // 1. Identify configured video providers
   const activeProviders = [];
   if (process.env.FAL_KEY) activeProviders.push('fal');
+  if (process.env.GOOGLE_VEO_API_KEY) activeProviders.push('google');
   if (process.env.REPLICATE_API_TOKEN) activeProviders.push('replicate');
+  if (process.env.LEONARDO_API_KEY) activeProviders.push('leonardo');
+  if (process.env.KLING_API_KEY) activeProviders.push('kling');
 
-  let providersToTry = [];
-  if (autoFallback) {
-    providersToTry = [provider, ...activeProviders.filter(p => p !== provider)];
-    providersToTry = [...new Set(providersToTry)].filter(p => activeProviders.includes(p));
-  } else {
-    providersToTry = [provider];
-  }
+  let providersToTry = autoFallback
+    ? [...new Set([provider, ...activeProviders])].filter(p => activeProviders.includes(p))
+    : [provider];
 
   if (providersToTry.length === 0) {
     return res.status(400).json({
       success: false,
-      error: `No active API keys found on Render for '${provider}'. Check your Render Environment Variables.`
+      error: `No active API keys found on Render for requested provider '${provider}'.`
     });
   }
 
+  let rawVideoUrl = null;
+  let successfulProvider = null;
   let lastError = null;
 
+  // 2. Route request to selected video API with fallback
   for (const currentProvider of providersToTry) {
     try {
-      console.log(`Executing engine: [${currentProvider.toUpperCase()}]`);
-      let videoUrl = null;
+      console.log(`Executing raw video generation on: [${currentProvider.toUpperCase()}]`);
 
       if (currentProvider === 'fal') {
-        videoUrl = await generateFal(prompt, imageUrl, aspectRatio);
+        rawVideoUrl = await generateFal(prompt, imageUrl, aspectRatio);
+      } else if (currentProvider === 'google') {
+        rawVideoUrl = await generateGoogle(prompt);
       } else if (currentProvider === 'replicate') {
-        videoUrl = await generateReplicate(prompt, imageUrl);
+        rawVideoUrl = await generateReplicate(prompt, imageUrl);
+      } else if (currentProvider === 'leonardo') {
+        rawVideoUrl = await generateLeonardo(prompt, imageUrl);
+      } else if (currentProvider === 'kling') {
+        rawVideoUrl = await generateKling(prompt, imageUrl);
       }
 
-      if (videoUrl) {
-        console.log(`Successfully generated video via [${currentProvider.toUpperCase()}]`);
-        return res.json({ success: true, provider: currentProvider, videoUrl });
+      if (rawVideoUrl) {
+        successfulProvider = currentProvider;
+        console.log(`Raw video ready from [${currentProvider.toUpperCase()}]: ${rawVideoUrl}`);
+        break;
       }
     } catch (err) {
       console.error(`Failed on [${currentProvider.toUpperCase()}]:`, err.message);
@@ -63,30 +80,245 @@ app.post('/api/generate-video', async (req, res) => {
     }
   }
 
-  return res.status(500).json({
-    success: false,
-    error: `API generation failed. ${lastError || 'Check your API keys and balances.'}`
-  });
+  if (!rawVideoUrl) {
+    return res.status(500).json({
+      success: false,
+      error: `All raw video API engines failed. ${lastError}`
+    });
+  }
+
+  // 3. Send raw video to JSON2Video for post-production
+  try {
+    console.log('Transmitting raw video to JSON2Video engine...');
+    const finalRenderedUrl = await renderWithJSON2Video(rawVideoUrl, {
+      captionText: captionText || prompt,
+      voiceoverText,
+      logoUrl,
+      musicUrl
+    });
+
+    return res.json({
+      success: true,
+      provider: successfulProvider,
+      rawVideoUrl: rawVideoUrl,
+      finalVideoUrl: finalRenderedUrl
+    });
+  } catch (j2vErr) {
+    console.error('JSON2Video Post-Production Error:', j2vErr.message);
+    // Fallback: Return raw video if JSON2Video is unconfigured or fails
+    return res.json({
+      success: true,
+      provider: successfulProvider,
+      warning: `JSON2Video post-processing skipped: ${j2vErr.message}`,
+      finalVideoUrl: rawVideoUrl
+    });
+  }
 });
 
-// --- PROVIDER IMPLEMENTATIONS ---
+// =========================================================================
+// RAW VIDEO PROVIDERS
+// =========================================================================
 
 // 1. FAL.AI Engine
 async function generateFal(prompt, imageUrl, aspectRatio) {
   const FAL_KEY = process.env.FAL_KEY;
-  if (!FAL_KEY) throw new Error('FAL_KEY environment variable missing on Render.');
-
   const endpoint = imageUrl 
     ? 'https://queue.fal.run/fal-ai/minimax/video-01/image-to-video'
     : 'https://queue.fal.run/fal-ai/minimax/video-01';
 
-  const payload = imageUrl ? { prompt, image_url: imageUrl } : { prompt, aspect_ratio: aspectRatio };
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Authorization': `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(imageUrl ? { prompt, image_url: imageUrl } : { prompt, aspect_ratio: aspectRatio })
+  });
 
-  console.log('[FAL.AI] Submitting request...');
-  const response = await fetch(endpoint, {
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+
+  // Poll request
+  const statusUrl = `https://queue.fal.run/fal-ai/minimax/requests/${data.request_id}/status`;
+  const resultUrl = `https://queue.fal.run/fal-ai/minimax/requests/${data.request_id}`;
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 4000));
+    const sRes = await fetch(statusUrl, { headers: { 'Authorization': `Key ${FAL_KEY}` } });
+    if (!sRes.ok) continue;
+    const sData = await sRes.json();
+    if (sData.status === 'COMPLETED') {
+      const rRes = await fetch(resultUrl, { headers: { 'Authorization': `Key ${FAL_KEY}` } });
+      const rData = await rRes.json();
+      return rData.video?.url || rData.video_url;
+    }
+  }
+  throw new Error('FAL timed out.');
+}
+
+// 2. GOOGLE VEO Engine
+async function generateGoogle(prompt) {
+  const GOOGLE_KEY = process.env.GOOGLE_VEO_API_KEY;
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predict?key=${GOOGLE_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: { text: prompt } })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.generatedVideos?.[0]?.videoUri;
+}
+
+// 3. REPLICATE Engine
+async function generateReplicate(prompt, imageUrl) {
+  const REPLICATE_KEY = process.env.REPLICATE_API_TOKEN;
+  const payload = { input: { prompt } };
+  if (imageUrl) payload.input.image = imageUrl;
+
+  const res = await fetch('https://api.replicate.com/v1/models/lucataco/wan-2.1-1.3b/predictions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${REPLICATE_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+
+  let pred = await res.json();
+  while (pred.status !== 'succeeded' && pred.status !== 'failed') {
+    await new Promise(r => setTimeout(r, 4000));
+    const cRes = await fetch(pred.urls.get, { headers: { 'Authorization': `Bearer ${REPLICATE_KEY}` } });
+    if (cRes.ok) pred = await cRes.json();
+  }
+  if (pred.status === 'succeeded') return Array.isArray(pred.output) ? pred.output[0] : pred.output;
+  throw new Error(`Replicate error: ${pred.error}`);
+}
+
+// 4. LEONARDO AI Engine
+async function generateLeonardo(prompt, imageUrl) {
+  const LEONARDO_KEY = process.env.LEONARDO_API_KEY;
+  const res = await fetch('https://cloud.leonardo.ai/api/rest/v1/generations-motion', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${LEONARDO_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, motionStrength: 5 })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const generationId = data.motionGenerationJob?.generationId;
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 4000));
+    const cRes = await fetch(`https://cloud.leonardo.ai/api/rest/v1/generations/${generationId}`, {
+      headers: { 'Authorization': `Bearer ${LEONARDO_KEY}` }
+    });
+    if (!cRes.ok) continue;
+    const cData = await cRes.json();
+    const videoUrl = cData.generations_by_pk?.generated_images?.[0]?.motionMP4URL;
+    if (videoUrl) return videoUrl;
+  }
+  throw new Error('Leonardo timed out.');
+}
+
+// 5. KLING / LUMA Engine
+async function generateKling(prompt, imageUrl) {
+  const KLING_KEY = process.env.KLING_API_KEY;
+  const res = await fetch('https://api.klingai.com/v1/videos/text2video', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${KLING_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, duration: "5" })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const taskId = data.data?.task_id;
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 4000));
+    const cRes = await fetch(`https://api.klingai.com/v1/videos/text2video/${taskId}`, {
+      headers: { 'Authorization': `Bearer ${KLING_KEY}` }
+    });
+    if (!cRes.ok) continue;
+    const cData = await cRes.json();
+    if (cData.data?.task_status === 'succeed') {
+      return cData.data?.task_result?.videos?.[0]?.url;
+    }
+  }
+  throw new Error('Kling timed out.');
+}
+
+// =========================================================================
+// POST-PRODUCTION ENGINE (JSON2Video)
+// =========================================================================
+async function renderWithJSON2Video(rawVideoUrl, options) {
+  const J2V_KEY = process.env.JSON2VIDEO_API_KEY;
+  if (!J2V_KEY) throw new Error('JSON2VIDEO_API_KEY missing on Render.');
+
+  const elements = [
+    // 1. Base Raw AI Video Element
+    {
+      type: "video",
+      url: rawVideoUrl,
+      start: 0
+    }
+  ];
+
+  // 2. Animated Captions / Overlay Text
+  if (options.captionText) {
+    elements.push({
+      type: "text",
+      text: options.captionText,
+      start: 0.5,
+      duration: 5,
+      style: "subtitle",
+      "font-family": "Montserrat",
+      "font-size": 32,
+      color: "#00E5FF",
+      y: "80%",
+      x: "center"
+    });
+  }
+
+  // 3. Logo Watermark Overlay
+  if (options.logoUrl) {
+    elements.push({
+      type: "image",
+      url: options.logoUrl,
+      width: 120,
+      x: "90%",
+      y: "10%",
+      opacity: 0.8
+    });
+  }
+
+  // 4. Voiceover / Text-To-Speech
+  if (options.voiceoverText) {
+    elements.push({
+      type: "voice",
+      text: options.voiceoverText,
+      voice: "en-US-Neural2-F",
+      start: 0
+    });
+  }
+
+  // 5. Background Music
+  if (options.musicUrl) {
+    elements.push({
+      type: "audio",
+      url: options.musicUrl,
+      volume: 0.3,
+      start: 0
+    });
+  }
+
+  const payload = {
+    resolution: "hd",
+    quality: "high",
+    scenes: [
+      {
+        transition: { name: "fade", duration: 0.5 },
+        elements: elements
+      }
+    ]
+  };
+
+  const response = await fetch('https://api.json2video.com/v2/movies', {
     method: 'POST',
     headers: {
-      'Authorization': `Key ${FAL_KEY}`,
+      'x-api-key': J2V_KEY,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(payload)
@@ -94,81 +326,33 @@ async function generateFal(prompt, imageUrl, aspectRatio) {
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`HTTP ${response.status}: ${errText}`);
+    throw new Error(`JSON2Video API HTTP ${response.status}: ${errText}`);
   }
 
-  const data = await response.json();
-  const requestId = data.request_id;
-  if (!requestId) throw new Error('FAL did not return a valid request_id.');
+  const projectData = await response.json();
+  const projectId = projectData.project;
 
-  // Poll status
-  const statusUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}/status`;
-  const resultUrl = `https://queue.fal.run/fal-ai/minimax/requests/${requestId}`;
-
+  // Poll project completion
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 4000));
-    const statusRes = await fetch(statusUrl, {
-      headers: { 'Authorization': `Key ${FAL_KEY}` }
+    const statusRes = await fetch(`https://api.json2video.com/v2/movies?project=${projectId}`, {
+      headers: { 'x-api-key': J2V_KEY }
     });
-    
+
     if (!statusRes.ok) continue;
     const statusData = await statusRes.json();
 
-    if (statusData.status === 'COMPLETED') {
-      const resVal = await fetch(resultUrl, {
-        headers: { 'Authorization': `Key ${FAL_KEY}` }
-      });
-      const finalData = await resVal.json();
-      return finalData.video?.url || finalData.video_url;
-    } else if (statusData.status === 'FAILED') {
-      throw new Error(`Processing failed: ${statusData.error || 'Unknown error'}`);
+    if (statusData.movie?.url) {
+      return statusData.movie.url;
+    } else if (statusData.movie?.status === 'error') {
+      throw new Error('JSON2Video rendering failed.');
     }
   }
-  throw new Error('FAL generation timed out.');
-}
 
-// 2. REPLICATE Engine
-async function generateReplicate(prompt, imageUrl) {
-  const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
-  if (!REPLICATE_API_TOKEN) throw new Error('REPLICATE_API_TOKEN environment variable missing on Render.');
-
-  console.log('[Replicate] Submitting request...');
-  
-  const inputPayload = { prompt, prompt_optimizer: true };
-  if (imageUrl) inputPayload.first_frame_image = imageUrl;
-
-  const response = await fetch('https://api.replicate.com/v1/models/minimax/video-01/predictions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${REPLICATE_API_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ input: inputPayload })
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`HTTP ${response.status}: ${errText}`);
-  }
-
-  let prediction = await response.json();
-
-  while (prediction.status !== 'succeeded' && prediction.status !== 'failed') {
-    await new Promise(r => setTimeout(r, 4000));
-    const checkRes = await fetch(prediction.urls.get, {
-      headers: { 'Authorization': `Bearer ${REPLICATE_API_TOKEN}` }
-    });
-    if (!checkRes.ok) continue;
-    prediction = await checkRes.json();
-  }
-
-  if (prediction.status === 'succeeded') {
-    return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-  } else {
-    throw new Error(`Replicate generation failed: ${prediction.error || 'Unknown error'}`);
-  }
+  throw new Error('JSON2Video render timed out.');
 }
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+      
