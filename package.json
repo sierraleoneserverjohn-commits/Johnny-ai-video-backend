@@ -1,16 +1,16 @@
 {
-  "name": "johnny-tec-ai-video-cluster",
+  "name": "johnny-tec-ai-video-backend",
   "version": "2.0.0",
-  "description": "Omnichannel Video Cluster Engine with JSON2Video Post-Production",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "express": "^4.21.2"
   }
 }
